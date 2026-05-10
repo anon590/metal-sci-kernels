@@ -157,6 +157,9 @@ $\sim 0.6$ min/iter, Gemini $\sim 3.5$ min/iter, GPT $\sim 6.6$ min/iter.
 
 ### `hmc` iter 5 → iter 6 (Opus): the `template <uint D>` win
 
+*Source: [iter 5](results/hmc_claude-opus-4-7_20260506_182733/05_candidate.metal),
+[iter 6](results/hmc_claude-opus-4-7_20260506_182733/06_candidate.metal)*
+
 One declaration takes $d{=}8$ from 121 to 970 GFLOPS in a single iteration.
 With `D` a compile-time constant the per-thread `q/p/f` arrays are sized
 exactly and the inner $A\,q$ matvec fully unrolls into a static FMA chain
@@ -197,6 +200,9 @@ only $\{8,16,32\}$ — that's the silent-correctness fail at $d{=}24$.
 
 ### `fft3d` GPT-5.5: hand-coded fast paths + $O(N^2)$ DFT fallback
 
+*Source: [10_candidate.metal](results/fft3d_gpt-5.5_20260508_153111/10_candidate.metal)
+(= [best.metal](results/fft3d_gpt-5.5_20260508_153111/best.metal))*
+
 The iter-10 best wins the in-distribution gmean at $2.95\times$. Held-out
 $N{=}256$ does not match any of the hand-coded sizes and falls into a
 textbook direct DFT — $\sim 32\times$ more arithmetic per output than the
@@ -230,6 +236,9 @@ whose stride indexing only covers $N{\leq}128$ — the structural reason
 the fallback is direct DFT rather than a longer FFT.
 
 ### `lbm` Opus vs Gemini: tightening BGK with FMA folds + pinned geometry
+
+*Sources: [Opus iter-23 best](results/lbm_claude-opus-4-7_20260506_112341/23_candidate.metal),
+[Gemini iter-13 best](results/lbm_gemini-3.1-pro-preview_20260507_145623/13_candidate.metal)*
 
 The Opus–Gemini split correlates with the type of optimization lever.
 *Tune the same algorithm tighter* (Opus) vs *find a different algorithm*
@@ -273,6 +282,9 @@ In-distribution gmean: Opus 0.576 vs Gemini 0.553.
 
 ### `fft3d` Opus vs Gemini: Stockham radix-4 vs `simd_shuffle_xor`
 
+*Sources: [Opus iter-10 best](results/fft3d_claude-opus-4-7_20260506_221310/10_candidate.metal),
+[Gemini iter-10 best](results/fft3d_gemini-3.1-pro-preview_20260506_222508/10_candidate.metal)*
+
 On `fft3d` the diff is two different algorithms. Apple's simdgroup width
 is exactly 32, so for the first five Cooley–Tukey stages the butterfly
 partner of lane $i$ is at lane $i \oplus 2^{s-1}$ with $2^{s-1}<32$ —
@@ -313,6 +325,9 @@ for (uint s = 6u; s <= logN; ++s) { /* ... */ }
 In-distribution gmean: Gemini 0.282 vs Opus 0.167 ($1.7\times$).
 
 ### `hmc` GPT-5.5: defensive `D` enumeration covering held-out $d{=}24$
+
+*Source: [06_candidate.metal](results/hmc_gpt-5.5_20260508_091035/06_candidate.metal)
+(= [best.metal](results/hmc_gpt-5.5_20260508_091035/best.metal))*
 
 Where Opus enumerates only `D∈{8,16,32}` (silent fail at $d{=}24$) and
 Gemini keeps a pure runtime-$d$ fallback (slower but safe), GPT-5.5 takes
