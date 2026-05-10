@@ -153,6 +153,190 @@ as an oversight primitive:
 A rough generation-time profile at high reasoning budgets: Opus
 $\sim 0.6$ min/iter, Gemini $\sim 3.5$ min/iter, GPT $\sim 6.6$ min/iter.
 
+## Notable kernel snippets
+
+### `hmc` iter 5 → iter 6 (Opus): the `template <uint D>` win
+
+One declaration takes $d{=}8$ from 121 to 970 GFLOPS in a single iteration.
+With `D` a compile-time constant the per-thread `q/p/f` arrays are sized
+exactly and the inner $A\,q$ matvec fully unrolls into a static FMA chain
+(prior iters had a manually-unrolled `float4` loop against a fixed
+`D_MAX=32` layout, plus a 4-way horizontal sum):
+
+```metal
+// iter 5: runtime d, D_MAX=32 layout
+for (uint i = 0; i < d; ++i) {
+    float4 acc = Arow[0] * q4[0];
+    acc = fma(Arow[1], q4[1], acc);
+    /* ... 6 more, always 8 ... */
+    acc = fma(Arow[7], q4[7], acc);
+    f[i] = acc.x + acc.y + acc.z + acc.w;
+}
+// d=8: 121 GFLOPS (2.7% of peak)
+
+// iter 6: template<uint D> with runtime dispatch on d
+template <uint D>
+inline void run(...) {
+    float q[D], p[D], f[D];
+    #pragma unroll
+    for (uint i = 0; i < D; ++i) {
+        float acc = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < D; ++j) acc = fma(A[i*D + j], q[j], acc);
+        f[i] = acc;
+    }
+}
+if      (d == 8u)  run<8u> (...);
+else if (d == 16u) run<16u>(...);
+else               run<32u>(...);   // ← held-out d=24 lands here, silently
+// d=8: 970 GFLOPS (22% of peak)
+```
+
+Both Opus and Gemini independently arrive at this lever. Opus enumerates
+only $\{8,16,32\}$ — that's the silent-correctness fail at $d{=}24$.
+
+### `fft3d` GPT-5.5: hand-coded fast paths + $O(N^2)$ DFT fallback
+
+The iter-10 best wins the in-distribution gmean at $2.95\times$. Held-out
+$N{=}256$ does not match any of the hand-coded sizes and falls into a
+textbook direct DFT — $\sim 32\times$ more arithmetic per output than the
+seed's $O(N\log N)$ Stockham FFT, the cleanest silent-regression instance
+in the sweep:
+
+```metal
+// dispatch in fft3d_x kernel
+threadgroup float2 buf0[128];
+threadgroup float2 buf1[128];
+if      (N == 32u)  fft_line_32_io(...);
+else if (N == 64u)  fft_line_64_io(...,  buf0);
+else if (N == 128u) fft_line_128_io(..., buf0, buf1);
+else                fft_line_direct_fallback_io(...);   // ← held-out N=256
+
+// fft_line_direct_fallback_io: O(N²) direct DFT
+float2 acc   = float2(0.0f, 0.0f);
+float  theta = -TWO_PI * float(tid) / float(N);
+float2 wstep = float2(cos(theta), sin(theta));
+float2 w     = float2(1.0f, 0.0f);
+for (uint n = 0u; n < N; ++n) {
+    float2 v = in_data[in_base + n * in_stride];
+    acc += cmul(v, w);
+    w    = cmul(w, wstep);
+}
+out_data[out_base + tid * out_stride] = acc;
+```
+
+The fast paths reuse a 64-entry `constant float2 W128[]` twiddle table
+whose stride indexing only covers $N{\leq}128$ — the structural reason
+the fallback is direct DFT rather than a longer FFT.
+
+### `lbm` Opus vs Gemini: tightening BGK with FMA folds + pinned geometry
+
+The Opus–Gemini split correlates with the type of optimization lever.
+*Tune the same algorithm tighter* (Opus) vs *find a different algorithm*
+(Gemini). On `lbm`, Opus extracts $A = \mathrm{fma}(-1.5, \|\mathbf{u}\|^2, 1)$
+once, factors the per-direction equilibrium as $A + cu \cdot (3 + 4.5\,cu)$
+(two FMAs), folds the relaxation into a third, and pins
+`[[max_total_threads_per_threadgroup(64)]]` to align the threadgroup
+to the simdgroup width:
+
+```metal
+// Opus iter-23 best: BGK fold + pinned geometry
+[[max_total_threads_per_threadgroup(64)]]
+kernel void lbm_step(...) {
+    // pull-stream f0..f8, moments rho, ux, uy ...
+    float A    = fma(-1.5f, usq, 1.0f);
+    float orWD = (omega * W_D) * rho;
+    // k=5: cu = ux + uy
+    {
+        float cu = ux + uy;
+        float t  = A + cu * fma(4.5f, cu, 3.0f);
+        q5[idx]  = fma(one_m_w, f5, orWD * t);
+    }
+    // 8 more directions, same shape ...
+}
+
+// Gemini iter-13 best: textbook BGK in unrolled loop
+kernel void lbm_step(...) {
+    float usq     = ux*ux + uy*uy;
+    float inv_tau = 1.0f / tau;
+    #pragma unroll
+    for (int k = 0; k < 9; ++k) {
+        float cu  = CX[k]*ux + CY[k]*uy;
+        float feq = W[k] * rho *
+                    (1.0f + 3.0f*cu + 4.5f*cu*cu - 1.5f*usq);
+        f_out[k*N + idx] = f[k] - inv_tau * (f[k] - feq);
+    }
+}
+```
+
+In-distribution gmean: Opus 0.576 vs Gemini 0.553.
+
+### `fft3d` Opus vs Gemini: Stockham radix-4 vs `simd_shuffle_xor`
+
+On `fft3d` the diff is two different algorithms. Apple's simdgroup width
+is exactly 32, so for the first five Cooley–Tukey stages the butterfly
+partner of lane $i$ is at lane $i \oplus 2^{s-1}$ with $2^{s-1}<32$ —
+fetchable via `simd_shuffle_xor` with no shared memory and no barrier.
+Only stages $s\geq 6$ fall back to threadgroup memory. This is a
+Metal-specific lever (single hardware permute) worth $\sim 5$ barriers
+per length-$N$ FFT, $\sim 15$ per 3D transform:
+
+```metal
+// Opus iter-10 best: Stockham radix-4, all in tg memory
+for (uint s = 0u; s < stages4; ++s) {
+    float2 x0 = cur[b + 0u*Nq];
+    float2 x1 = cur[b + 1u*Nq];
+    float2 x2 = cur[b + 2u*Nq];
+    float2 x3 = cur[b + 3u*Nq];
+    if (s != 0u) { /* twiddle multiplies */ }
+    // 4-point DFT, write to nxt[]
+    threadgroup_barrier(mem_threadgroup);
+    swap(cur, nxt);
+}
+
+// Gemini iter-10 best: simd_shuffle_xor for stages 1..5
+//                     (no shared mem, no barrier)
+if (logN >= 1u) {
+    float2 v = simd_shuffle_xor(u, 1u);
+    u = ((i & 1u) == 0u) ? (u + v) : (v - u);
+}
+// stages 2..4 analogous (xor 2, 4, 8)
+if (logN >= 5u) {
+    float2 v = simd_shuffle_xor(u, 16u);
+    // twiddle, butterfly ...
+    u = ((i & 16u) == 0u) ? (u + t) : (v - t);
+}
+// stages s>=6: fall back to tg memory
+for (uint s = 6u; s <= logN; ++s) { /* ... */ }
+```
+
+In-distribution gmean: Gemini 0.282 vs Opus 0.167 ($1.7\times$).
+
+### `hmc` GPT-5.5: defensive `D` enumeration covering held-out $d{=}24$
+
+Where Opus enumerates only `D∈{8,16,32}` (silent fail at $d{=}24$) and
+Gemini keeps a pure runtime-$d$ fallback (slower but safe), GPT-5.5 takes
+the union: an explicit `D∈{8,16,24,32}` set with fully-templated instances
+plus a runtime-$d$ catch-all. The held-out dimension is a first-class
+instantiation, not a special case to round up or fall back on:
+
+```metal
+// hmc_step dispatch (GPT-5.5 iter-3 best)
+load_A_transpose_tg(A, AT, d, tid, tpg);
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+if      (d == 8u)   run_hmc_fixed_chunk8<8u >(...);
+else if (d == 16u)  run_hmc_d16(...);                  // specialized d=16
+else if (d == 24u)  run_hmc_fixed_chunk8<24u>(...);    // ← covers held-out d
+else if (d == 32u)  run_hmc_fixed_chunk8<32u>(...);
+else                run_hmc_dynamic(..., d, ...);      // runtime-d safety net
+```
+
+In-distribution gmean comes in lower than Opus or Gemini (0.0634 vs
+0.0932, 0.0870) — the cost of emitting four template instantiations
+plus a runtime fallback — but held-out $d{=}24$ runs at $10.2\%$ of
+FP32 peak, $18.6\times$ the seed.
+
 ## Adding a new task
 
 Drop a `seeds/<name>.metal` and a `metal_kernels/tasks/<name>.py`
